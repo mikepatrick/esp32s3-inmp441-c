@@ -11,7 +11,39 @@ i2s_chan_handle_t rx_handle;
 void setup() {
   Serial.begin(115200);
   while (!Serial) delay(10);
+  configure_pins();
+}
 
+void loop() {
+  int32_t stereo_sample = get_sample();
+}
+
+int32_t get_sample() {
+  int32_t stereo_sample[2] = { 0 };
+  size_t bytes_read = 0;
+
+  // Read the raw 8-byte stereo chunk
+  esp_err_t err = i2s_channel_read(rx_handle, &stereo_sample, sizeof(stereo_sample), &bytes_read, 100);
+
+  if (err == ESP_OK && bytes_read == sizeof(stereo_sample)) {
+    // Grab the left channel raw container
+    int32_t raw_sample = stereo_sample[0];
+
+    // CORRECT SIGN EXTENSION: Because the driver padded zeroes at the bottom,
+    // the data is already aligned to the absolute top of the 32-bit container.
+    // We just shift it down by 8 bits to restore its true 24-bit signed integer value!
+    int32_t true_sample = raw_sample >> 8;
+
+    // Print the raw waveform value to the Serial Plotter
+    if (true_sample > 1000000) {
+      Serial.println(true_sample);
+      return true_sample;
+    }
+  }
+  return 0;
+}
+
+void configure_pins() {
   Serial.println("--- Starting Hardware-Aligned I2S Test ---");
 
   // 1. Allocate the hardware I2S channel
@@ -43,27 +75,4 @@ void setup() {
   // Turn on the clock lines
   i2s_channel_enable(rx_handle);
   Serial.println("Microphone hardware clock active. Speak now!");
-}
-
-void loop() {
-  int32_t stereo_sample[2] = { 0 };
-  size_t bytes_read = 0;
-
-  // Read the raw 8-byte stereo chunk
-  esp_err_t err = i2s_channel_read(rx_handle, &stereo_sample, sizeof(stereo_sample), &bytes_read, 100);
-
-  if (err == ESP_OK && bytes_read == sizeof(stereo_sample)) {
-    // Grab the left channel raw container
-    int32_t raw_sample = stereo_sample[0];
-
-    // CORRECT SIGN EXTENSION: Because the driver padded zeroes at the bottom,
-    // the data is already aligned to the absolute top of the 32-bit container.
-    // We just shift it down by 8 bits to restore its true 24-bit signed integer value!
-    int32_t true_sample = raw_sample >> 8;
-
-    // Print the raw waveform value to the Serial Plotter
-    if (true_sample > 1000000) {
-      Serial.println(true_sample);
-    }
-  }
 }
