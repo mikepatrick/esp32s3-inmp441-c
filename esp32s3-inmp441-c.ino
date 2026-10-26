@@ -1,86 +1,69 @@
 #include <Arduino.h>
-// I2S interface for INMP441 microphone
-#include <ESP_I2S.h>
+#include <driver/i2s_std.h>
 
-// Microphone pins
-#define I2S_SCK_PIN  4
-#define I2S_WS_PIN   5
-#define I2S_SD_PIN   6
+// Your verified pins from MicroPython
+#define I2S_SCK_PIN 4
+#define I2S_WS_PIN 5
+#define I2S_SD_PIN 6
 
 i2s_chan_handle_t rx_handle;
 
 void setup() {
-    Serial.begin(115200);
-    while (!Serial) delay(10);
+  Serial.begin(115200);
+  while (!Serial) delay(10);
 
-    Serial.println("=== FINAL STABILIZATION: FORCING PLL_160M & PHILIPS ===");
+  Serial.println("--- Starting Hardware-Aligned I2S Test ---");
 
-    // 1. Allocate channels
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    i2s_new_channel(&chan_cfg, NULL, &rx_handle);
+  // 1. Allocate the hardware I2S channel
+  i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
+  i2s_new_channel(&chan_cfg, NULL, &rx_handle);
 
-    // 2. Build the standard configuration manually to force the clock source
-    i2s_std_config_t std_cfg = {
-    .clk_cfg = {
-        .sample_rate_hz = 16000,
-        .clk_src = I2S_CLK_SRC_PLL_160M, // Force 160MHz internal PLL clock pool
-        .mclk_multiple = I2S_MCLK_MULTIPLE_384 // Divisible by 3 to clear 24/32-bit math errors
-    },
-    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO), 
+  // 2. Configure 64-clock timing (Stereo layout, 32-bit slot container)
+  i2s_std_config_t std_cfg = {
+    .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000),  // 16kHz
+    .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
     .gpio_cfg = {
-        .mclk = I2S_GPIO_UNUSED,
-        .bclk = (gpio_num_t)I2S_SCK_PIN,
-        .ws   = (gpio_num_t)I2S_WS_PIN,
-        .dout = I2S_GPIO_UNUSED,
-        .din  = (gpio_num_t)I2S_SD_PIN,
-        .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false }
-    }
-    };
+      .mclk = I2S_GPIO_UNUSED,
+      .bclk = (gpio_num_t)I2S_SCK_PIN,
+      .ws = (gpio_num_t)I2S_WS_PIN,
+      .dout = I2S_GPIO_UNUSED,
+      .din = (gpio_num_t)I2S_SD_PIN,
+      .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false } }
+  };
 
-    // Ensure both slots are driven so the clock hits 64 cycles per frame
-    std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH; 
+  // Force both slots active to ensure the clock hits exactly 64 pulses per frame
+  std_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
 
-    if (i2s_channel_init_std_mode(rx_handle, &std_cfg) != ESP_OK) {
-    Serial.println("Failed to initialize standard mode framework!");
-    while(1);
-    }
+  if (i2s_channel_init_std_mode(rx_handle, &std_cfg) != ESP_OK) {
+    Serial.println("I2S Initialization failed!");
+    while (1)
+      ;
+  }
 
-    i2s_channel_enable(rx_handle);
-    Serial.println("System fully stabilized.");
+  // Turn on the clock lines
+  i2s_channel_enable(rx_handle);
+  Serial.println("Microphone hardware clock active. Speak now!");
 }
 
 void loop() {
-    // Read a stereo frame (Left 32-bit + Right 32-bit = 8 bytes)
-    int32_t flash_buffer[2] = {0}; 
-    size_t bytes_read = 0;
+  int32_t stereo_sample[2] = { 0 };
+  size_t bytes_read = 0;
 
-    // Perform blocking direct read from the DMA buffer
-    esp_err_t err = i2s_channel_read(rx_handle, &flash_buffer, sizeof(flash_buffer), &bytes_read, 100);
+  // Read the raw 8-byte stereo chunk
+  esp_err_t err = i2s_channel_read(rx_handle, &stereo_sample, sizeof(stereo_sample), &bytes_read, 100);
 
-    if (err == ESP_OK && bytes_read > 0) {
-        // Because L/R is grounded, our audio data lives inside the Left channel slot (index 0)
-        int32_t raw_sample = flash_buffer[0];
+  if (err == ESP_OK && bytes_read == sizeof(stereo_sample)) {
+    // Grab the left channel raw container
+    int32_t raw_sample = stereo_sample[0];
 
-        // Sign extend 24-bit PCM data to standard 32-bit signed integers
-        if (raw_sample & 0x00800000) {
-            raw_sample |= 0xFF000000;
-        }
+    // CORRECT SIGN EXTENSION: Because the driver padded zeroes at the bottom,
+    // the data is already aligned to the absolute top of the 32-bit container.
+    // We just shift it down by 8 bits to restore its true 24-bit signed integer value!
+    int32_t true_sample = raw_sample >> 8;
 
-        // Print output to verify wave activity
-        if (raw_sample != 0) {
-            Serial.println(raw_sample);
-            // Map the large 32-bit values down to an easily readable 0-100 sound level
-            int volumeIndicator = map(abs(raw_sample), 0, 8388607, 0, 100);
-
-            // Clap or blow into the mic to watch this value jump
-            for(int i=0; i<volumeIndicator; i++) {
-            Serial.print("|");
-            }
-            Serial.println();
-        }
-    } else {
-        // Debug indicator if the physical link drops or breaks
-        Serial.println("DMA Buffer underflow or timeout.");
-        delay(100);
+    // Print the raw waveform value to the Serial Plotter
+    if (true_sample > 1000000) {
+      Serial.println(true_sample);
     }
+  }
 }
